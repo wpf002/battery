@@ -21,7 +21,9 @@ struct UsageStatus {
 }
 
 enum BatteryError: Error {
-    case noToken
+    case noToken(OSStatus)   // OSStatus so Keychain denials are distinguishable from "never logged in"
+    case emptyToken          // credential is present but signed out
+    case badCredential
     case http(Int)
     case parse
 }
@@ -37,13 +39,12 @@ func readAccessToken() throws -> String {
     ]
     var item: CFTypeRef?
     let status = SecItemCopyMatching(query as CFDictionary, &item)
-    guard status == errSecSuccess,
-          let data = item as? Data,
-          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+    guard status == errSecSuccess, let data = item as? Data else { throw BatteryError.noToken(status) }
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
           let oauth = json["claudeAiOauth"] as? [String: Any],
-          let token = oauth["accessToken"] as? String,
-          !token.isEmpty
-    else { throw BatteryError.noToken }
+          let token = oauth["accessToken"] as? String
+    else { throw BatteryError.badCredential }
+    guard !token.isEmpty else { throw BatteryError.emptyToken }
     return token
 }
 
@@ -96,7 +97,12 @@ func fetchStatus(completion: @escaping (Result<UsageStatus, Error>) -> Void) {
 func describe(_ error: Error) -> String {
     if let e = error as? BatteryError {
         switch e {
-        case .noToken: return "Not logged in. Run `claude` and sign in."
+        case .noToken(errSecItemNotFound): return "Not logged in. Run `claude` and sign in."
+        case .noToken(let st):
+            let msg = SecCopyErrorMessageString(st, nil) as String? ?? "unknown"
+            return "Keychain denied access (\(st): \(msg))"
+        case .emptyToken: return "Signed out. Run `claude` and sign in."
+        case .badCredential: return "Keychain entry isn't a Claude Code credential"
         case .http(401): return "Token expired. Start a Claude Code session to refresh it."
         case .http(let code): return "API error HTTP \(code)"
         case .parse: return "Unexpected API response"
