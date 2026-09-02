@@ -362,7 +362,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.menu = NSMenu()
         item.menu?.delegate = self
         render()
-        showOverlay()
         // The status item has no window until the menu bar has placed it, so the
         // notch check needs a second pass once layout has happened.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.render() }
