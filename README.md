@@ -20,6 +20,14 @@ That compiles `Sources/main.swift` into `build/ClaudeBattery.app`, ad-hoc signs 
 
 Refresh now · Show percentage (toggle the % text next to the icon) · Launch at login · Quit.
 
+Launch at login can also be set without opening the menu:
+
+```bash
+/Applications/ClaudeBattery.app/Contents/MacOS/ClaudeBattery --register-login
+```
+
+`--unregister-login` turns it back off.
+
 ## Troubleshooting
 
 - "Not logged in": run `claude` and sign in, then Refresh now.

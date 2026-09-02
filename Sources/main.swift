@@ -286,6 +286,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
+// `--register-login` / `--unregister-login`: flip the login item and exit,
+// through the same SMAppService path the menu item uses. Scriptable, no UI.
+if let flag = CommandLine.arguments.dropFirst().first,
+   flag == "--register-login" || flag == "--unregister-login" {
+    let enable = flag == "--register-login"
+    do {
+        if enable { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+        print("Launch at login \(enable ? "enabled" : "disabled").")
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data("Failed: \(error.localizedDescription)\n".utf8))
+        exit(1)
+    }
+}
+
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
