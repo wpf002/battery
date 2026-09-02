@@ -34,6 +34,7 @@ enum BatteryError: Error {
 // Every Keychain read can raise a system password prompt, and the refresh
 // timer runs every 30s — so the result, success or failure, is cached for the
 // process lifetime. Only a 401 or an explicit Refresh now re-reads it.
+var rateLimitedUntil: Date?
 private let tokenLock = NSLock()
 private var cachedToken: Result<String, Error>?
 
@@ -190,6 +191,11 @@ func fetchStatus(completion: @escaping (Result<UsageStatus, Error>) -> Void) {
         }
         guard http.statusCode == 200 else {
             if http.statusCode == 401 { forgetCachedToken() }   // token rotated; re-read next time
+            if http.statusCode == 429 {
+                // Honour Retry-After; polling through a rate limit only extends it.
+                let after = Double(http.value(forHTTPHeaderField: "retry-after") ?? "") ?? 300
+                rateLimitedUntil = Date().addingTimeInterval(after)
+            }
             completion(.failure(BatteryError.http(http.statusCode))); return
         }
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -407,6 +413,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func refresh() {
+        if let until = rateLimitedUntil, until > Date() { return }
         // The Keychain read can raise a system prompt, which blocks its thread
         // until answered — so it must not run on the main thread or the window
         // never gets a chance to draw.
