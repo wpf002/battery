@@ -49,22 +49,68 @@ func readAccessToken() throws -> String {
     return try result.get()
 }
 
-private func readTokenFromKeychain() throws -> String {
+// Claude Code stores credentials under "Claude Code-credentials" plus
+// per-install "…-<hash>" variants. The bare one is often a signed-out
+// leftover, so prefer the most recently written entry that carries a token.
+private let credentialPrefix = "Claude Code-credentials"
+
+private func credentialServices() -> [String] {
     let query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: "Claude Code-credentials",
+        kSecReturnAttributes as String: true,
+        kSecMatchLimit as String: kSecMatchLimitAll,
+    ]
+    var out: CFTypeRef?
+    guard SecItemCopyMatching(query as CFDictionary, &out) == errSecSuccess,
+          let items = out as? [[String: Any]] else { return [] }
+    return items
+        .filter { ($0[kSecAttrService as String] as? String)?.hasPrefix(credentialPrefix) == true }
+        .sorted {
+            let l = $0[kSecAttrModificationDate as String] as? Date ?? .distantPast
+            let r = $1[kSecAttrModificationDate as String] as? Date ?? .distantPast
+            return l > r
+        }
+        .compactMap { $0[kSecAttrService as String] as? String }
+}
+
+private func token(fromService service: String) -> String? {
+    let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: service,
         kSecReturnData as String: true,
         kSecMatchLimit as String: kSecMatchLimitOne,
     ]
-    var item: CFTypeRef?
-    let status = SecItemCopyMatching(query as CFDictionary, &item)
-    guard status == errSecSuccess, let data = item as? Data else { throw BatteryError.noToken(status) }
-    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+    var out: CFTypeRef?
+    guard SecItemCopyMatching(query as CFDictionary, &out) == errSecSuccess,
+          let data = out as? Data,
+          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
           let oauth = json["claudeAiOauth"] as? [String: Any],
-          let token = oauth["accessToken"] as? String
-    else { throw BatteryError.badCredential }
-    guard !token.isEmpty else { throw BatteryError.emptyToken }
+          let token = oauth["accessToken"] as? String,
+          !token.isEmpty
+    else { return nil }
     return token
+}
+
+private func readTokenFromKeychain() throws -> String {
+    let services = credentialServices()
+    guard !services.isEmpty else { throw BatteryError.noToken(errSecItemNotFound) }
+
+    // Remembering the entry that worked keeps this to one Keychain prompt per
+    // launch instead of one per candidate.
+    var ordered = services
+    if let remembered = UserDefaults.standard.string(forKey: "credentialService"),
+       let i = ordered.firstIndex(of: remembered) {
+        ordered.remove(at: i)
+        ordered.insert(remembered, at: 0)
+    }
+
+    for service in ordered.prefix(4) {
+        if let token = token(fromService: service) {
+            UserDefaults.standard.set(service, forKey: "credentialService")
+            return token
+        }
+    }
+    throw BatteryError.emptyToken
 }
 
 // MARK: - API
@@ -256,20 +302,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func refresh() {
-        fetchStatus { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                switch result {
-                case .success(let s):
-                    self.status = s
-                    self.lastError = nil
-                    self.lastUpdate = Date()
-                    self.defaults.set(true, forKey: "keychainGranted")
-                case .failure(let e):
-                    self.lastError = describe(e)
-                    if case BatteryError.emptyToken = e { self.defaults.set(true, forKey: "keychainGranted") }
+        // The Keychain read can raise a system prompt, which blocks its thread
+        // until answered — so it must not run on the main thread or the window
+        // never gets a chance to draw.
+        DispatchQueue.global(qos: .utility).async {
+            fetchStatus { [weak self] result in
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    switch result {
+                    case .success(let s):
+                        self.status = s
+                        self.lastError = nil
+                        self.lastUpdate = Date()
+                        self.defaults.set(true, forKey: "keychainGranted")
+                    case .failure(let e):
+                        self.lastError = describe(e)
+                        if case BatteryError.emptyToken = e { self.defaults.set(true, forKey: "keychainGranted") }
+                    }
+                    self.render()
                 }
-                self.render()
             }
         }
     }
