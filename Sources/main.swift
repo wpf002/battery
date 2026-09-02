@@ -214,6 +214,7 @@ func notchBand(for screen: NSScreen?) -> (start: CGFloat, end: CGFloat)? {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var item: NSStatusItem!
+    private var panel: NSPanel?
     private var timer: Timer?
     private var status: UsageStatus?
     private var lastError: String?
@@ -232,6 +233,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.menu = NSMenu()
         item.menu?.delegate = self
         render()
+        showWindow()
         // The status item has no window until the menu bar has placed it, so the
         // notch check needs a second pass once layout has happened.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.render() }
@@ -286,6 +288,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let w = status?.sevenDay { tip += "\nWeekly: \(Int(w.remainingPct.rounded()))% left, \(humanReset(w.resetsAt))" }
         if let e = lastError { tip += "\n\(e)" }
         item.button?.toolTip = tip
+        updatePanel()
     }
 
     // A full menu bar leaves only the slot under the camera housing, where
@@ -338,6 +341,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Refresh now", action: #selector(refreshAction), keyEquivalent: "r"))
+        menu.addItem(NSMenuItem(title: "Show window", action: #selector(showWindow), keyEquivalent: "w"))
 
         let pct = NSMenuItem(title: "Show percentage", action: #selector(togglePercent), keyEquivalent: "")
         pct.state = showPercent ? .on : .off
@@ -351,6 +355,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+    }
+
+    // The menu bar item does not paint on some macOS versions, so the same
+    // numbers are also shown in a small floating window.
+    private func makePanel() -> NSPanel {
+        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 330, height: 170),
+                        styleMask: [.titled, .closable, .utilityWindow],
+                        backing: .buffered, defer: false)
+        p.title = "Claude Battery"
+        p.level = .floating
+        p.isFloatingPanel = true
+        p.hidesOnDeactivate = false
+        p.isReleasedWhenClosed = false
+
+        let v = p.contentView!
+        let icon = NSImageView(frame: NSRect(x: 18, y: 112, width: 60, height: 34))
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        icon.identifier = NSUserInterfaceItemIdentifier("icon")
+        v.addSubview(icon)
+
+        func label(_ y: CGFloat, _ id: String, _ size: CGFloat, _ bold: Bool) {
+            let t = NSTextField(labelWithString: "")
+            t.frame = NSRect(x: 18, y: y, width: 296, height: 18)
+            t.font = bold ? .boldSystemFont(ofSize: size) : .systemFont(ofSize: size)
+            t.identifier = NSUserInterfaceItemIdentifier(id)
+            t.lineBreakMode = .byTruncatingTail
+            v.addSubview(t)
+        }
+        label(84, "five", 13, true)
+        label(62, "week", 13, true)
+        label(38, "note", 11, false)
+
+        let refresh = NSButton(title: "Refresh now", target: self, action: #selector(refreshAction))
+        refresh.frame = NSRect(x: 14, y: 6, width: 116, height: 26)
+        refresh.bezelStyle = .rounded
+        v.addSubview(refresh)
+
+        let quit = NSButton(title: "Quit", target: NSApp, action: #selector(NSApplication.terminate(_:)))
+        quit.frame = NSRect(x: 250, y: 6, width: 66, height: 26)
+        quit.bezelStyle = .rounded
+        v.addSubview(quit)
+
+        if let screen = NSScreen.main {
+            let f = screen.visibleFrame
+            p.setFrameTopLeftPoint(NSPoint(x: f.maxX - 350, y: f.maxY - 10))
+        }
+        return p
+    }
+
+    private func sub(_ id: String) -> NSView? {
+        panel?.contentView?.subviews.first { $0.identifier?.rawValue == id }
+    }
+
+    @objc func showWindow() {
+        if panel == nil { panel = makePanel() }
+        panel?.orderFrontRegardless()
+        updatePanel()
+    }
+
+    private func updatePanel() {
+        guard panel != nil else { return }
+        (sub("icon") as? NSImageView)?.image = batteryImage(remaining: status?.fiveHour?.remainingPct, percentText: nil)
+        func set(_ id: String, _ text: String) { (sub(id) as? NSTextField)?.stringValue = text }
+        if let w = status?.fiveHour {
+            set("five", "5-hour: \(Int(w.remainingPct.rounded()))% left · \(humanReset(w.resetsAt))")
+        } else { set("five", "5-hour: no data") }
+        if let w = status?.sevenDay {
+            set("week", "Weekly: \(Int(w.remainingPct.rounded()))% left · \(humanReset(w.resetsAt))")
+        } else { set("week", "Weekly: no data") }
+        set("note", lastError ?? (lastUpdate != nil ? "Updated" : "Click Refresh now"))
     }
 
     @objc func togglePercent() {
