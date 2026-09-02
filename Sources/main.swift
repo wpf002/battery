@@ -151,10 +151,27 @@ func levelColor(_ remaining: Double) -> NSColor {
     return .systemRed
 }
 
-func batteryImage(remaining: Double?) -> NSImage {
-    let size = NSSize(width: 26, height: 14)
+// Content is drawn at the LEFT end of the image. `padTo` widens the image to
+// the right with transparent filler, which is how the icon escapes the notch:
+// the menu bar pins the item's right edge, so a wider item reaches further left.
+func batteryImage(remaining: Double?, percentText: String?, padTo: CGFloat = 0) -> NSImage {
+    let glyph: CGFloat = 26
+    var textWidth: CGFloat = 0
+    let attrs: [NSAttributedString.Key: Any] = [
+        .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular),
+        .foregroundColor: NSColor.labelColor,
+    ]
+    var label: NSAttributedString?
+    if let t = percentText {
+        let a = NSAttributedString(string: t, attributes: attrs)
+        label = a
+        textWidth = a.size().width + 3
+    }
+    let contentWidth = glyph + textWidth
+    let size = NSSize(width: max(contentWidth, padTo), height: 16)
+
     return NSImage(size: size, flipped: false) { _ in
-        let body = NSRect(x: 1, y: 1.5, width: 21, height: 11)
+        let body = NSRect(x: 1, y: 2.5, width: 21, height: 11)
         let ink = NSColor.labelColor.withAlphaComponent(0.85)
 
         let outline = NSBezierPath(roundedRect: body, xRadius: 2.5, yRadius: 2.5)
@@ -163,7 +180,7 @@ func batteryImage(remaining: Double?) -> NSImage {
         outline.stroke()
 
         ink.setFill()
-        NSBezierPath(roundedRect: NSRect(x: 22.6, y: 5, width: 2, height: 4), xRadius: 0.8, yRadius: 0.8).fill()
+        NSBezierPath(roundedRect: NSRect(x: 22.6, y: 6, width: 2, height: 4), xRadius: 0.8, yRadius: 0.8).fill()
 
         if let r = remaining {
             let inner = body.insetBy(dx: 2, dy: 2)
@@ -172,16 +189,25 @@ func batteryImage(remaining: Double?) -> NSImage {
             NSBezierPath(roundedRect: NSRect(x: inner.minX, y: inner.minY, width: w, height: inner.height),
                          xRadius: 1.2, yRadius: 1.2).fill()
         } else {
-            let attrs: [NSAttributedString.Key: Any] = [
+            let q = NSAttributedString(string: "?", attributes: [
                 .font: NSFont.systemFont(ofSize: 9, weight: .bold),
                 .foregroundColor: NSColor.labelColor,
-            ]
-            let q = NSAttributedString(string: "?", attributes: attrs)
+            ])
             let sz = q.size()
             q.draw(at: NSPoint(x: body.midX - sz.width / 2, y: body.midY - sz.height / 2))
         }
+
+        label?.draw(at: NSPoint(x: glyph, y: 2))
         return true
     }
+}
+
+// The notch band on the active screen, in screen points, or nil if there is none.
+func notchBand(for screen: NSScreen?) -> (start: CGFloat, end: CGFloat)? {
+    guard let screen = screen,
+          let left = screen.auxiliaryTopLeftArea,
+          let right = screen.auxiliaryTopRightArea else { return nil }
+    return (left.maxX, right.minX)
 }
 
 // MARK: - App
@@ -206,10 +232,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.menu = NSMenu()
         item.menu?.delegate = self
         render()
-        refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in self?.refresh() }
+        // The status item has no window until the menu bar has placed it, so the
+        // notch check needs a second pass once layout has happened.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.render() }
+        // Only touch the Keychain on its own once the user has granted access —
+        // otherwise every launch raises a system password prompt for nothing.
+        if defaults.bool(forKey: "keychainGranted") { refresh() }
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            guard let self = self, self.defaults.bool(forKey: "keychainGranted") else { return }
+            self.refresh()
+        }
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(refreshAction), name: NSWorkspace.didWakeNotification, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(render), name: NSApplication.didChangeScreenParametersNotification, object: nil)
     }
 
     @objc func refreshAction() {
@@ -226,27 +262,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.status = s
                     self.lastError = nil
                     self.lastUpdate = Date()
+                    self.defaults.set(true, forKey: "keychainGranted")
                 case .failure(let e):
                     self.lastError = describe(e)
+                    if case BatteryError.emptyToken = e { self.defaults.set(true, forKey: "keychainGranted") }
                 }
                 self.render()
             }
         }
     }
 
-    private func render() {
+    @objc private func render() {
         let remaining = status?.fiveHour?.remainingPct
-        item.button?.image = batteryImage(remaining: remaining)
-        if showPercent, let r = remaining {
-            item.button?.title = " \(Int(r.rounded()))%"
-        } else {
-            item.button?.title = ""
-        }
+        let text = (showPercent && remaining != nil) ? "\(Int(remaining!.rounded()))%" : nil
+
+        item.button?.title = ""
+        item.button?.image = batteryImage(remaining: remaining, percentText: text)
+        item.length = NSStatusItem.variableLength
+        escapeNotchIfNeeded(remaining: remaining, text: text)
+
         var tip = "Claude Code usage"
         if let w = status?.fiveHour { tip += "\n5-hour: \(Int(w.remainingPct.rounded()))% left, \(humanReset(w.resetsAt))" }
         if let w = status?.sevenDay { tip += "\nWeekly: \(Int(w.remainingPct.rounded()))% left, \(humanReset(w.resetsAt))" }
         if let e = lastError { tip += "\n\(e)" }
         item.button?.toolTip = tip
+    }
+
+    // A full menu bar leaves only the slot under the camera housing, where
+    // nothing is drawn. The menu bar pins the item's right edge, so padding the
+    // image to the right pushes the visible content left, out of the notch.
+    private func escapeNotchIfNeeded(remaining: Double?, text: String?) {
+        guard let win = item.button?.window,
+              let notch = notchBand(for: win.screen ?? NSScreen.main) else { return }
+        let frame = win.frame
+        let contentWidth = item.button?.image?.size.width ?? 26
+        guard frame.minX + contentWidth > notch.start, frame.minX < notch.end else { return }
+
+        let needed = frame.maxX - notch.start + contentWidth + 6
+        guard needed > contentWidth, needed < 400 else { return }
+        item.button?.image = batteryImage(remaining: remaining, percentText: text, padTo: needed)
+        item.length = needed
     }
 
     // Menu is rebuilt each time it opens so countdowns are fresh.

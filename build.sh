@@ -13,7 +13,10 @@ swiftc -O \
   -framework AppKit -framework Security -framework ServiceManagement
 
 cp Info.plist "$APP/Contents/Info.plist"
-codesign --force --sign - "$APP"   # ad-hoc signature so the Keychain grant sticks
+# A real identity keeps the signature stable across rebuilds, so the Keychain
+# grant survives; ad-hoc changes every build and re-prompts for the password.
+ID=$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/Apple Development|Developer ID/{print $2; exit}')
+codesign --force --sign "${ID:--}" "$APP"
 
 pkill -x ClaudeBattery 2>/dev/null || true
 rm -rf /Applications/ClaudeBattery.app
