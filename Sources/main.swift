@@ -100,7 +100,30 @@ private func read(service: String) -> CredentialRead {
     return .token(token)
 }
 
+// `claude setup-token` prints a long-lived token but stores it nowhere, and a
+// GUI app never sees the shell's CLAUDE_CODE_OAUTH_TOKEN. So look first for a
+// token the user has parked in the Keychain under our own service.
+private let ownService = "ClaudeBattery-token"
+
+private func ownToken() -> String? {
+    if let env = ProcessInfo.processInfo.environment["CLAUDE_CODE_OAUTH_TOKEN"], !env.isEmpty { return env }
+    let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: ownService,
+        kSecReturnData as String: true,
+        kSecMatchLimit as String: kSecMatchLimitOne,
+    ]
+    var out: CFTypeRef?
+    guard SecItemCopyMatching(query as CFDictionary, &out) == errSecSuccess,
+          let data = out as? Data,
+          let token = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !token.isEmpty
+    else { return nil }
+    return token
+}
+
 private func readTokenFromKeychain() throws -> String {
+    if let token = ownToken() { return token }
     let services = credentialServices()
     guard !services.isEmpty else { throw BatteryError.noToken(errSecItemNotFound) }
 
