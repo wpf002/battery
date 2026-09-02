@@ -185,8 +185,8 @@ func describe(_ error: Error) -> String {
             let msg = SecCopyErrorMessageString(st, nil) as String? ?? "unknown"
             return "Keychain denied access (\(st): \(msg))"
         case .emptyToken: return "Signed out. Run `claude` and sign in."
-        case .noneUsable(let total, let signedOut, let denied):
-            return "\(total) credential entries; checked \(signedOut + denied): \(signedOut) signed out, \(denied) unreadable"
+        case .noneUsable:
+            return "No Claude Code login found on this Mac."
         case .badCredential: return "Keychain entry isn't a Claude Code credential"
         case .http(401): return "Token expired. Start a Claude Code session to refresh it."
         case .http(let code): return "API error HTTP \(code)"
@@ -301,13 +301,42 @@ func notchBand(for screen: NSScreen?) -> (start: CGFloat, end: CGFloat)? {
 final class IconView: NSView {
     var image: NSImage? { didSet { needsDisplay = true } }
     var onClick: (() -> Void)?
+    private var dragOrigin: NSPoint?
+    private var dragged = false
+
     override func draw(_ dirty: NSRect) {
         guard let image = image else { return }
         let r = NSRect(x: 0, y: (bounds.height - image.size.height) / 2,
                        width: image.size.width, height: image.size.height)
         image.draw(in: r, from: .zero, operation: .sourceOver, fraction: 1)
     }
-    override func mouseDown(with event: NSEvent) { onClick?() }
+
+    override func mouseDown(with event: NSEvent) {
+        dragOrigin = NSEvent.mouseLocation
+        dragged = false
+    }
+
+    // Drag to reposition; the spot is remembered across launches.
+    override func mouseDragged(with event: NSEvent) {
+        guard let start = dragOrigin, let win = window else { return }
+        let now = NSEvent.mouseLocation
+        if abs(now.x - start.x) > 2 || abs(now.y - start.y) > 2 { dragged = true }
+        var f = win.frame
+        f.origin.x += now.x - start.x
+        f.origin.y += now.y - start.y
+        win.setFrameOrigin(f.origin)
+        dragOrigin = now
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if let win = window, dragged {
+            UserDefaults.standard.set(Double(win.frame.origin.x), forKey: "overlayX")
+            UserDefaults.standard.set(Double(win.frame.origin.y), forKey: "overlayY")
+        } else {
+            onClick?()
+        }
+        dragOrigin = nil
+    }
 }
 
 // MARK: - App
@@ -485,15 +514,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         func label(_ y: CGFloat, _ id: String, _ size: CGFloat, _ bold: Bool) {
             let t = NSTextField(labelWithString: "")
-            t.frame = NSRect(x: 18, y: y, width: 296, height: 18)
+            t.frame = NSRect(x: 18, y: y, width: 296, height: id == "note" ? 30 : 18)
             t.font = bold ? .boldSystemFont(ofSize: size) : .systemFont(ofSize: size)
             t.identifier = NSUserInterfaceItemIdentifier(id)
-            t.lineBreakMode = .byTruncatingTail
+            t.lineBreakMode = id == "note" ? .byWordWrapping : .byTruncatingTail
+            t.maximumNumberOfLines = id == "note" ? 2 : 1
             v.addSubview(t)
         }
         label(84, "five", 13, true)
         label(62, "week", 13, true)
-        label(38, "note", 11, false)
+        label(30, "note", 11, false)
 
         let refresh = NSButton(title: "Refresh now", target: self, action: #selector(refreshAction))
         refresh.frame = NSRect(x: 14, y: 6, width: 116, height: 26)
@@ -527,6 +557,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             x = notch.end + 6
         } else {
             x = screen.frame.maxX - 420
+        }
+        let d = UserDefaults.standard
+        if d.object(forKey: "overlayX") != nil, d.object(forKey: "overlayY") != nil {
+            return NSRect(x: d.double(forKey: "overlayX"), y: d.double(forKey: "overlayY"), width: w, height: h)
         }
         return NSRect(x: x, y: top + 1, width: w, height: h)
     }
