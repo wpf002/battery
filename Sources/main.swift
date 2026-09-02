@@ -23,6 +23,7 @@ struct UsageStatus {
 enum BatteryError: Error {
     case noToken(OSStatus)   // OSStatus so Keychain denials are distinguishable from "never logged in"
     case emptyToken          // credential is present but signed out
+    case noneUsable(total: Int, signedOut: Int, denied: Int)
     case badCredential
     case http(Int)
     case parse
@@ -73,7 +74,15 @@ private func credentialServices() -> [String] {
         .compactMap { $0[kSecAttrService as String] as? String }
 }
 
-private func token(fromService service: String) -> String? {
+// Distinguishing these three matters: "no token anywhere" and "the Keychain
+// wouldn't let us look" need very different advice.
+enum CredentialRead {
+    case token(String)
+    case signedOut(OSStatus)   // readable, but accessToken was absent or empty
+    case denied(OSStatus)      // Keychain refused the read
+}
+
+private func read(service: String) -> CredentialRead {
     let query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: service,
@@ -81,14 +90,14 @@ private func token(fromService service: String) -> String? {
         kSecMatchLimit as String: kSecMatchLimitOne,
     ]
     var out: CFTypeRef?
-    guard SecItemCopyMatching(query as CFDictionary, &out) == errSecSuccess,
-          let data = out as? Data,
-          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+    let status = SecItemCopyMatching(query as CFDictionary, &out)
+    guard status == errSecSuccess, let data = out as? Data else { return .denied(status) }
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
           let oauth = json["claudeAiOauth"] as? [String: Any],
           let token = oauth["accessToken"] as? String,
           !token.isEmpty
-    else { return nil }
-    return token
+    else { return .signedOut(status) }
+    return .token(token)
 }
 
 private func readTokenFromKeychain() throws -> String {
@@ -104,13 +113,19 @@ private func readTokenFromKeychain() throws -> String {
         ordered.insert(remembered, at: 0)
     }
 
-    for service in ordered.prefix(4) {
-        if let token = token(fromService: service) {
+    var signedOut = 0, denied = 0
+    for service in ordered.prefix(6) {
+        switch read(service: service) {
+        case .token(let t):
             UserDefaults.standard.set(service, forKey: "credentialService")
-            return token
+            return t
+        case .signedOut: signedOut += 1
+        case .denied: denied += 1
         }
     }
-    throw BatteryError.emptyToken
+    let err = BatteryError.noneUsable(total: services.count, signedOut: signedOut, denied: denied)
+    FileHandle.standardError.write(Data("claudebattery: \(describe(err))\n".utf8))
+    throw err
 }
 
 // MARK: - API
@@ -170,6 +185,8 @@ func describe(_ error: Error) -> String {
             let msg = SecCopyErrorMessageString(st, nil) as String? ?? "unknown"
             return "Keychain denied access (\(st): \(msg))"
         case .emptyToken: return "Signed out. Run `claude` and sign in."
+        case .noneUsable(let total, let signedOut, let denied):
+            return "\(total) credential entries; checked \(signedOut + denied): \(signedOut) signed out, \(denied) unreadable"
         case .badCredential: return "Keychain entry isn't a Claude Code credential"
         case .http(401): return "Token expired. Start a Claude Code session to refresh it."
         case .http(let code): return "API error HTTP \(code)"
@@ -192,58 +209,80 @@ func humanReset(_ date: Date?) -> String {
 // MARK: - Icon
 
 func levelColor(_ remaining: Double) -> NSColor {
-    if remaining > 50 { return .systemGreen }
-    if remaining > 20 { return .systemOrange }
-    return .systemRed
+    if remaining > 50 { return NSColor(srgbRed: 0.55, green: 0.79, blue: 0.55, alpha: 1) }
+    if remaining > 20 { return NSColor(srgbRed: 0.90, green: 0.68, blue: 0.33, alpha: 1) }
+    return NSColor(srgbRed: 0.89, green: 0.32, blue: 0.27, alpha: 1)
 }
 
-// Content is drawn at the LEFT end of the image. `padTo` widens the image to
-// the right with transparent filler, which is how the icon escapes the notch:
-// the menu bar pins the item's right edge, so a wider item reaches further left.
+// Claude's mark: tapered petals radiating from a point.
+func drawSunburst(center: NSPoint, radius: CGFloat, color: NSColor, spokes: Int = 11) {
+    color.setFill()
+    for i in 0..<spokes {
+        let a = CGFloat(i) * 2 * .pi / CGFloat(spokes)
+        let perp = a + .pi / 2
+        let w = radius * 0.30
+        let tip = NSPoint(x: center.x + cos(a) * radius, y: center.y + sin(a) * radius)
+        let mid = NSPoint(x: center.x + cos(a) * radius * 0.34, y: center.y + sin(a) * radius * 0.34)
+        let p = NSBezierPath()
+        p.move(to: center)
+        p.line(to: NSPoint(x: mid.x + cos(perp) * w * 0.5, y: mid.y + sin(perp) * w * 0.5))
+        p.line(to: tip)
+        p.line(to: NSPoint(x: mid.x - cos(perp) * w * 0.5, y: mid.y - sin(perp) * w * 0.5))
+        p.close()
+        p.fill()
+    }
+}
+
+let batterySize = NSSize(width: 30, height: 15)
+
+// Content is drawn at the LEFT end; `padTo` adds transparent filler to the right.
 func batteryImage(remaining: Double?, percentText: String?, padTo: CGFloat = 0) -> NSImage {
-    let glyph: CGFloat = 26
     var textWidth: CGFloat = 0
-    let attrs: [NSAttributedString.Key: Any] = [
-        .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular),
-        .foregroundColor: NSColor.labelColor,
-    ]
     var label: NSAttributedString?
     if let t = percentText {
-        let a = NSAttributedString(string: t, attributes: attrs)
+        let a = NSAttributedString(string: t, attributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular),
+            .foregroundColor: NSColor.labelColor,
+        ])
         label = a
-        textWidth = a.size().width + 3
+        textWidth = a.size().width + 4
     }
-    let contentWidth = glyph + textWidth
+    let contentWidth = batterySize.width + textWidth
     let size = NSSize(width: max(contentWidth, padTo), height: 16)
 
     return NSImage(size: size, flipped: false) { _ in
-        let body = NSRect(x: 1, y: 2.5, width: 21, height: 11)
-        let ink = NSColor.labelColor.withAlphaComponent(0.85)
+        let shell = NSColor(white: 0.80, alpha: 1)
+        let body = NSRect(x: 1, y: 1.5, width: 25, height: 13)
 
-        let outline = NSBezierPath(roundedRect: body, xRadius: 2.5, yRadius: 2.5)
-        outline.lineWidth = 1.2
-        ink.setStroke()
+        shell.setFill()
+        NSBezierPath(roundedRect: NSRect(x: 26.4, y: 5.5, width: 2.6, height: 5),
+                     xRadius: 1.1, yRadius: 1.1).fill()
+
+        let outline = NSBezierPath(roundedRect: body, xRadius: 3.4, yRadius: 3.4)
+        outline.lineWidth = 1.8
+        shell.setStroke()
         outline.stroke()
 
-        ink.setFill()
-        NSBezierPath(roundedRect: NSRect(x: 22.6, y: 6, width: 2, height: 4), xRadius: 0.8, yRadius: 0.8).fill()
-
+        let inner = body.insetBy(dx: 2, dy: 2)
         if let r = remaining {
-            let inner = body.insetBy(dx: 2, dy: 2)
-            let w = max(1.5, inner.width * CGFloat(r) / 100)
+            let fw = max(2, inner.width * CGFloat(r) / 100)
+            let fill = NSRect(x: inner.minX, y: inner.minY, width: fw, height: inner.height)
             levelColor(r).setFill()
-            NSBezierPath(roundedRect: NSRect(x: inner.minX, y: inner.minY, width: w, height: inner.height),
-                         xRadius: 1.2, yRadius: 1.2).fill()
+            NSBezierPath(roundedRect: fill, xRadius: 1.6, yRadius: 1.6).fill()
+
+            let c = NSPoint(x: inner.midX, y: inner.midY)
+            drawSunburst(center: c, radius: inner.height * 0.52,
+                         color: c.x <= fill.maxX - 1 ? NSColor(white: 0.08, alpha: 1) : levelColor(r))
         } else {
             let q = NSAttributedString(string: "?", attributes: [
-                .font: NSFont.systemFont(ofSize: 9, weight: .bold),
-                .foregroundColor: NSColor.labelColor,
+                .font: NSFont.systemFont(ofSize: 10, weight: .bold),
+                .foregroundColor: shell,
             ])
             let sz = q.size()
             q.draw(at: NSPoint(x: body.midX - sz.width / 2, y: body.midY - sz.height / 2))
         }
 
-        label?.draw(at: NSPoint(x: glyph, y: 2))
+        label?.draw(at: NSPoint(x: batterySize.width + 2, y: 2))
         return true
     }
 }
@@ -256,11 +295,28 @@ func notchBand(for screen: NSScreen?) -> (start: CGFloat, end: CGFloat)? {
     return (left.maxX, right.minX)
 }
 
+// The status item is laid out but never painted when the menu bar has no
+// drawable slot left, so the icon is also drawn as a small always-on-top
+// window sitting in the menu bar strip.
+final class IconView: NSView {
+    var image: NSImage? { didSet { needsDisplay = true } }
+    var onClick: (() -> Void)?
+    override func draw(_ dirty: NSRect) {
+        guard let image = image else { return }
+        let r = NSRect(x: 0, y: (bounds.height - image.size.height) / 2,
+                       width: image.size.width, height: image.size.height)
+        image.draw(in: r, from: .zero, operation: .sourceOver, fraction: 1)
+    }
+    override func mouseDown(with event: NSEvent) { onClick?() }
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var item: NSStatusItem!
     private var panel: NSPanel?
+    private var overlay: NSPanel?
+    private var iconView: IconView?
     private var timer: Timer?
     private var status: UsageStatus?
     private var lastError: String?
@@ -279,7 +335,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.menu = NSMenu()
         item.menu?.delegate = self
         render()
-        showWindow()
+        showOverlay()
         // The status item has no window until the menu bar has placed it, so the
         // notch check needs a second pass once layout has happened.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.render() }
@@ -339,6 +395,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let w = status?.sevenDay { tip += "\nWeekly: \(Int(w.remainingPct.rounded()))% left, \(humanReset(w.resetsAt))" }
         if let e = lastError { tip += "\n\(e)" }
         item.button?.toolTip = tip
+        iconView?.image = batteryImage(remaining: remaining, percentText: text)
         updatePanel()
     }
 
@@ -457,6 +514,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func sub(_ id: String) -> NSView? {
         panel?.contentView?.subviews.first { $0.identifier?.rawValue == id }
+    }
+
+    // Sits in the free strip just right of the notch, where a menu bar icon
+    // would go, at the menu bar's own window level.
+    private func overlayFrame(on screen: NSScreen) -> NSRect {
+        let h: CGFloat = 22
+        let w = batterySize.width + 2
+        let top = screen.frame.maxY - (screen.safeAreaInsets.top > 0 ? screen.safeAreaInsets.top : 24)
+        let x: CGFloat
+        if let notch = notchBand(for: screen) {
+            x = notch.end + 6
+        } else {
+            x = screen.frame.maxX - 420
+        }
+        return NSRect(x: x, y: top + 1, width: w, height: h)
+    }
+
+    @objc func showOverlay() {
+        guard let screen = NSScreen.main else { return }
+        if overlay == nil {
+            let view = IconView(frame: .zero)
+            view.onClick = { [weak self] in self?.toggleWindow() }
+            iconView = view
+
+            let p = NSPanel(contentRect: overlayFrame(on: screen),
+                            styleMask: [.borderless, .nonactivatingPanel],
+                            backing: .buffered, defer: false)
+            p.level = .statusBar
+            p.backgroundColor = .clear
+            p.isOpaque = false
+            p.hasShadow = false
+            p.ignoresMouseEvents = false
+            p.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
+            p.contentView = view
+            overlay = p
+        }
+        overlay?.setFrame(overlayFrame(on: screen), display: true)
+        overlay?.orderFrontRegardless()
+    }
+
+    @objc func toggleWindow() {
+        if panel?.isVisible == true { panel?.orderOut(nil) } else { showWindow() }
     }
 
     @objc func showWindow() {
