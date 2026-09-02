@@ -30,7 +30,26 @@ enum BatteryError: Error {
 
 // MARK: - Keychain
 
+// Every Keychain read can raise a system password prompt, and the refresh
+// timer runs every 30s — so the result, success or failure, is cached for the
+// process lifetime. Only a 401 or an explicit Refresh now re-reads it.
+private let tokenLock = NSLock()
+private var cachedToken: Result<String, Error>?
+
+func forgetCachedToken() {
+    tokenLock.lock(); defer { tokenLock.unlock() }
+    cachedToken = nil
+}
+
 func readAccessToken() throws -> String {
+    tokenLock.lock(); defer { tokenLock.unlock() }
+    if let cached = cachedToken { return try cached.get() }
+    let result = Result { try readTokenFromKeychain() }
+    cachedToken = result
+    return try result.get()
+}
+
+private func readTokenFromKeychain() throws -> String {
     let query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: "Claude Code-credentials",
@@ -85,7 +104,10 @@ func fetchStatus(completion: @escaping (Result<UsageStatus, Error>) -> Void) {
         guard let http = resp as? HTTPURLResponse, let data = data else {
             completion(.failure(BatteryError.parse)); return
         }
-        guard http.statusCode == 200 else { completion(.failure(BatteryError.http(http.statusCode))); return }
+        guard http.statusCode == 200 else {
+            if http.statusCode == 401 { forgetCachedToken() }   // token rotated; re-read next time
+            completion(.failure(BatteryError.http(http.statusCode))); return
+        }
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             completion(.failure(BatteryError.parse)); return
         }
@@ -190,7 +212,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self, selector: #selector(refreshAction), name: NSWorkspace.didWakeNotification, object: nil)
     }
 
-    @objc func refreshAction() { refresh() }
+    @objc func refreshAction() {
+        forgetCachedToken()   // manual refresh re-reads the Keychain
+        refresh()
+    }
 
     func refresh() {
         fetchStatus { [weak self] result in
