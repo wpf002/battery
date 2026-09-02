@@ -321,17 +321,15 @@ final class IconView: NSView {
         guard let start = dragOrigin, let win = window else { return }
         let now = NSEvent.mouseLocation
         if abs(now.x - start.x) > 2 || abs(now.y - start.y) > 2 { dragged = true }
-        var f = win.frame
-        f.origin.x += now.x - start.x
-        f.origin.y += now.y - start.y
-        win.setFrameOrigin(f.origin)
+        var origin = win.frame.origin
+        origin.x += now.x - start.x          // horizontal only; the icon stays in the menu bar
+        win.setFrameOrigin(origin)
         dragOrigin = now
     }
 
     override func mouseUp(with event: NSEvent) {
         if let win = window, dragged {
             UserDefaults.standard.set(Double(win.frame.origin.x), forKey: "overlayX")
-            UserDefaults.standard.set(Double(win.frame.origin.y), forKey: "overlayY")
         } else {
             onClick?()
         }
@@ -523,7 +521,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         label(84, "five", 13, true)
         label(62, "week", 13, true)
-        label(30, "note", 11, false)
 
         let refresh = NSButton(title: "Refresh now", target: self, action: #selector(refreshAction))
         refresh.frame = NSRect(x: 14, y: 6, width: 116, height: 26)
@@ -558,11 +555,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             x = screen.frame.maxX - 420
         }
-        let d = UserDefaults.standard
-        if d.object(forKey: "overlayX") != nil, d.object(forKey: "overlayY") != nil {
-            return NSRect(x: d.double(forKey: "overlayX"), y: d.double(forKey: "overlayY"), width: w, height: h)
-        }
-        return NSRect(x: x, y: top + 1, width: w, height: h)
+        let saved = UserDefaults.standard.object(forKey: "overlayX") as? Double
+        return NSRect(x: saved.map { CGFloat($0) } ?? x, y: top + 1, width: w, height: h)
     }
 
     @objc func showOverlay() {
@@ -604,11 +598,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         func set(_ id: String, _ text: String) { (sub(id) as? NSTextField)?.stringValue = text }
         if let w = status?.fiveHour {
             set("five", "5-hour: \(Int(w.remainingPct.rounded()))% left · \(humanReset(w.resetsAt))")
-        } else { set("five", "5-hour: no data") }
+        } else { set("five", "5-hour: —") }
         if let w = status?.sevenDay {
             set("week", "Weekly: \(Int(w.remainingPct.rounded()))% left · \(humanReset(w.resetsAt))")
-        } else { set("week", "Weekly: no data") }
-        set("note", lastError ?? (lastUpdate != nil ? "Updated" : "Click Refresh now"))
+        } else { set("week", "Weekly: —") }
     }
 
     @objc func togglePercent() {
